@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <Servo.h>
 #include <HttpClient.h>
 #include <Adafruit_BusIO_Register.h>
 #include <WiFi.h>
@@ -14,22 +13,135 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_AHTX0.h>
 
-char ssid[50]; // your network SSID (name)
-char pass[50]; // your network password (use for WPA, or use
+char ssid[50];
+char pass[50];
 const int kNetworkTimeout = 30 * 1000;
 const int kNetworkDelay = 1000;
 
-const int sensorPin = 2;
-const int servoPin = 21;
+const int NUM_SENSORS = 3;
+const int light1 = 37;
+const int light2 = 38;
+const int light3 = 39; 
+const float PHOTORESISTOR_ANGLES[] = {PI / 3, PI, 5 * PI / 3};
 
-int currLight;
-int maxLight = 0;
-int maxAngle = 0;
+const int wheel11 = 32; // Wheel 1 forward
+const int wheel12 = 33; // Wheel 1 backward
+const int wheel21 = 13; // Wheel 2 forward
+const int wheel22 = 12; // Wheel 2 backward
+const int wheel31 = 25; // Wheel 3 forward
+const int wheel32 = 26; // Wheel 3 backward
 
-const int scanStep = 5; 
-const int delayTime = 100;
+const int pwmChannel11 = 0;
+const int pwmChannel12 = 1;
+const int pwmChannel21 = 2;
+const int pwmChannel22 = 3;
+const int pwmChannel31 = 4;
+const int pwmChannel32 = 5;
 
-Servo servo;
+unsigned long previousMillis = 0;
+const long interval = 1000; 
+
+const float WHEEL_ANGLE_OFFSET[] = {0, 2 * PI / 3, 4 * PI / 3};
+
+bool moveRobot = false;
+
+float findBrightestLightAngle() {
+  int lightValues[NUM_SENSORS] = {
+    analogRead(light1),
+    analogRead(light2),
+    analogRead(light3)
+  };
+
+  const int lightThreshold = 300; 
+  int maxIndex1 = -1, maxIndex2 = -1;
+  int maxValue = -1, minValue = INT_MAX;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int value = lightValues[i];
+    if (value > 3000) { 
+      continue;
+    }
+    if (value > maxValue) {
+      maxValue = value;
+    }
+    if (value < minValue) {
+      minValue = value;
+    }
+
+    if (maxIndex1 == -1 || value > lightValues[maxIndex1]) {
+      maxIndex2 = maxIndex1;
+      maxIndex1 = i;
+    } else if (maxIndex2 == -1 || value > lightValues[maxIndex2]) {
+      maxIndex2 = i;
+    }
+  }
+
+  if (maxValue - minValue < lightThreshold) {
+    return -1;
+  }
+
+  if (maxIndex2 == -1) {
+    float angle = PHOTORESISTOR_ANGLES[maxIndex1];
+  }
+
+  float weight1 = (float)lightValues[maxIndex1];
+  float weight2 = (float)lightValues[maxIndex2];
+
+  float angle1 = PHOTORESISTOR_ANGLES[maxIndex1];
+  float angle2 = PHOTORESISTOR_ANGLES[maxIndex2];
+
+  float x1 = weight1 * cos(angle1);
+  float y1 = weight1 * sin(angle1);
+  float x2 = weight2 * cos(angle2);
+  float y2 = weight2 * sin(angle2);
+
+  float avgX = x1 + x2;
+  float avgY = y1 + y2;
+  float brightestAngle = atan2(avgY, avgX);
+  
+  return brightestAngle < 0 ? brightestAngle + 2 * PI : brightestAngle;
+}
+
+void vectorToWheelSpeeds(float vx, float vy, float* wheelSpeeds) {
+  for (int i = 0; i < 3; i++) {
+    float angle = WHEEL_ANGLE_OFFSET[i];
+    wheelSpeeds[i] = -sin(angle) * vx + cos(angle) * vy;
+  }
+}
+
+void setWheelSpeed(int pinForward, int pinBackward, float speed, int forwardChannel, int backwardChannel) {
+  speed = constrain(speed, -1.0, 1.0);
+  int pwmValue = abs(speed * 2000);
+
+  if (speed > 0) {
+    ledcWrite(forwardChannel, pwmValue);
+    ledcWrite(backwardChannel, 0);
+  } else if (speed < 0) {
+    ledcWrite(backwardChannel, pwmValue);
+    ledcWrite(forwardChannel, 0);
+  } else {
+    ledcWrite(forwardChannel, 0);
+    ledcWrite(backwardChannel, 0);
+  }
+}
+
+void stopWheels() {
+  setWheelSpeed(wheel11, wheel12, 0, pwmChannel11, pwmChannel12);
+  setWheelSpeed(wheel21, wheel22, 0, pwmChannel21, pwmChannel22);
+  setWheelSpeed(wheel31, wheel32, 0, pwmChannel31, pwmChannel32);
+}
+
+void moveRobotTowardsAngle(float angle) {
+  float vx = cos(angle);
+  float vy = sin(angle);
+
+  float wheelSpeeds[3];
+  vectorToWheelSpeeds(vx, vy, wheelSpeeds);
+
+  setWheelSpeed(wheel11, wheel12, wheelSpeeds[0], pwmChannel11, pwmChannel12);
+  setWheelSpeed(wheel21, wheel22, wheelSpeeds[1], pwmChannel21, pwmChannel22);
+  setWheelSpeed(wheel31, wheel32, wheelSpeeds[2], pwmChannel31, pwmChannel32);
+}
 
 
 void nvs_access() {
@@ -70,46 +182,65 @@ void nvs_access() {
 }
 
 void setup() {
-  // put your setup code here, to run once:
   Serial.begin(9600);
-  servo.attach(servoPin);
-  servo.write(0);
   delay(1000);
 
   nvs_access();
 
   delay(1000);
-    Serial.println();
-    Serial.println();
-    Serial.print("Connecting to ");
-    Serial.println(ssid);
+  Serial.println();
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
 
-    WiFi.begin(ssid, pass);
+  WiFi.begin(ssid, pass);
 
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.println("MAC address: ");
-    Serial.println(WiFi.macAddress());
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("MAC address: ");
+  Serial.println(WiFi.macAddress());
 
+  Serial.println("Light-Tracking Robot Ready!");
+
+  // Set up PWM for wheels
+  ledcSetup(pwmChannel11, 5000, 8);
+  ledcSetup(pwmChannel12, 5000, 8);
+  ledcSetup(pwmChannel21, 5000, 8);
+  ledcSetup(pwmChannel22, 5000, 8);
+  ledcSetup(pwmChannel31, 5000, 8);
+  ledcSetup(pwmChannel32, 5000, 8);
+
+  ledcAttachPin(wheel11, pwmChannel11);
+  ledcAttachPin(wheel12, pwmChannel12);
+  ledcAttachPin(wheel21, pwmChannel21);
+  ledcAttachPin(wheel22, pwmChannel22);
+  ledcAttachPin(wheel31, pwmChannel31);
+  ledcAttachPin(wheel32, pwmChannel32);
 }
 
+// Loop Function
 void loop() {
-  maxLight = 0;
-  maxAngle = 0;
   int err = 0;
-
   WiFiClient c;
   HttpClient http(c);
 
-  String values = "/?light=" + String(maxLight, 2);
-  const char* query = values.c_str();
+  int lightValues[NUM_SENSORS] = {
+     analogRead(light1),
+     analogRead(light2),
+     analogRead(light3)
+  };
 
+  // Construct query string with light sensor values
+  String values = "/?light1=" + String(lightValues[0]) + 
+                  "&light2=" + String(lightValues[1]) + 
+                 "&light3=" + String(lightValues[2]);
+  const char* query = values.c_str();
   err = http.get("54.193.149.150", 5000, query, NULL);
     if (err == 0) {
         Serial.println("startedRequest ok");
@@ -117,36 +248,10 @@ void loop() {
         if (err >= 0) {
             Serial.print("Got status code: ");
             Serial.println(err);
-
-            // Usually you'd check that the response code is 200 or a
-            // similar "success" code (200-299) before carrying on,
-            // but we'll print out whatever response we get
             err = http.skipResponseHeaders();
             if (err >= 0) {
                 int bodyLen = http.contentLength();
-                Serial.print("Content length is: ");
-                Serial.println(bodyLen);
-                Serial.println();
-                Serial.println("Body returned follows:");
-
-                // Now we've got to the body, so we can print it out
-                unsigned long timeoutStart = millis();
-                char c;
-                // Whilst we haven't timed out & haven't reached the end of the body
-                while ((http.connected() || http.available()) && ((millis() - timeoutStart) < kNetworkTimeout)) {
-                    if (http.available()) {
-                        c = http.read();
-                        // Print out this character
-                        Serial.print(c);
-                        bodyLen--;
-                        // We read something, reset the timeout counter
-                        timeoutStart = millis();
-                    } else {
-                        // We haven't got any data, so let's pause to allow some to
-                        // arrive
-                        delay(kNetworkDelay);
-                    }
-                }
+                Serial.print("sent");
             } else {
                 Serial.print("Failed to skip response headers: ");
                 Serial.println(err);
@@ -160,32 +265,32 @@ void loop() {
         Serial.println(err);
     }
     http.stop();
+  unsigned long currentMillis = millis();
 
-    // And just stop, now that we've tried a download
-    //while (1);
-    delay(2000);
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
 
-  for (int angle = 0; angle <= 180; angle += scanStep) {
-    servo.write(angle);
-    delay(200);
-    currLight = analogRead(sensorPin);
+    float brightestAngle = findBrightestLightAngle();
     
-    Serial.print("Angle: ");
-    Serial.print(angle);
-    Serial.print(" - Light: ");
-    Serial.println(currLight);
-
-    if (currLight > maxLight) {
-      maxLight = currLight;
-      maxAngle = angle;
+    if (brightestAngle == -1) {
+      Serial.println("Light levels are too uniform. Robot will not move.");
+      stopWheels();
+      return;
     }
+    
+    Serial.print("Brightest Angle: ");
+    Serial.println(brightestAngle * 180 / PI);
+
+    moveRobotTowardsAngle(brightestAngle);
+    delay(250); 
+    stopWheels();
   }
 
-  servo.write(maxAngle);
-  Serial.print("Max Light: ");
-  Serial.print(maxLight);
-  Serial.print(" at Angle: ");
-  Serial.println(maxAngle);
-
-  delay(10000);
+  Serial.print("Light Values: ");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.print(lightValues[i]);
+    if (i < NUM_SENSORS - 1) Serial.print(" | ");
+  }
+  Serial.println();
+  delay(50);
 }
